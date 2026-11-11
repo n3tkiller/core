@@ -1,0 +1,149 @@
+blueprint:
+  name: Türklingel – Actionable Notification (Tür öffnen)
+  description: >
+    Wenn es klingelt, bekommt der Hauptnutzer immer eine Benachrichtigung mit den
+    Buttons "Öffnen" und "Ignorieren". Die zweite Person bekommt sie nur, wenn sie
+    zu Hause oder in der Nähe (Zone) ist. Erst nach Tipp auf "Öffnen" wird die
+    hinterlegte Aktion (z. B. Tür aufsperren) ausgeführt.
+    Dieses Blueprint einmal pro Tür anlegen (Haustür, Wohnungstür).
+  domain: automation
+  input:
+    door_name:
+      name: Name der Tür
+      description: Wird im Text der Benachrichtigung verwendet.
+      default: Haustür
+      selector:
+        text:
+    doorbell:
+      name: Klingel
+      description: binary_sensor, event- oder input_boolean-Entität der Klingel.
+      selector:
+        entity:
+          domain: [binary_sensor, event, input_boolean]
+    open_door_action:
+      name: Aktion "Tür öffnen"
+      description: Wird nur nach Bestätigung in der Benachrichtigung ausgeführt
+        (z. B. lock.unlock / lock.open oder ein Türöffner-Button).
+      selector:
+        action: {}
+    my_notify:
+      name: Mein Notify-Dienst
+      description: z. B. notify.mobile_app_mein_handy – bekommt immer die Meldung.
+      selector:
+        text:
+    tani_notify:
+      name: Notify-Dienst von Tani
+      description: z. B. notify.mobile_app_tanis_handy
+      selector:
+        text:
+    tani_person:
+      name: Person Tani
+      selector:
+        entity:
+          domain: person
+    nearby_zone:
+      name: Zone "in der Nähe von zu Hause"
+      description: Größere Zone um das Zuhause (z. B. 500 m). Standard ist nur zu Hause.
+      default: zone.home
+      selector:
+        entity:
+          domain: zone
+    timeout:
+      name: Wartezeit auf Antwort
+      default: 120
+      selector:
+        number:
+          min: 10
+          max: 600
+          unit_of_measurement: s
+
+mode: restart
+max_exceeded: silent
+
+trigger:
+  - platform: state
+    entity_id: !input doorbell
+    not_from: unavailable
+
+condition:
+  - condition: template
+    value_template: >
+      {{ trigger.to_state.state not in ['off', 'unavailable', 'unknown'] }}
+
+variables:
+  door_name: !input door_name
+  my_notify: !input my_notify
+  tani_notify: !input tani_notify
+  tani_person: !input tani_person
+  nearby_zone: !input nearby_zone
+  timeout_s: !input timeout
+  tag: "doorbell_{{ this.entity_id }}"
+  open_id: "DOORBELL_OPEN_{{ this.entity_id }}"
+  ignore_id: "DOORBELL_IGNORE_{{ this.entity_id }}"
+  tani_near: >
+    {{ is_state(tani_person, 'home')
+       or is_state(tani_person, state_attr(nearby_zone, 'friendly_name')) }}
+  recipients: >
+    {{ [my_notify] + ([tani_notify] if tani_near else []) }}
+
+action:
+  - repeat:
+      for_each: "{{ recipients }}"
+      sequence:
+        - service: "{{ repeat.item }}"
+          data:
+            title: "🔔 Es klingelt"
+            message: "Jemand klingelt an der {{ door_name }}. Tür öffnen?"
+            data:
+              tag: "{{ tag }}"
+              group: doorbell
+              importance: high
+              priority: high
+              ttl: 0
+              channel: Türklingel
+              push:
+                interruption-level: time-sensitive
+              actions:
+                - action: "{{ open_id }}"
+                  title: "Öffnen"
+                  authenticationRequired: true
+                - action: "{{ ignore_id }}"
+                  title: "Ignorieren"
+                  destructive: true
+  - wait_for_trigger:
+      - platform: event
+        event_type: mobile_app_notification_action
+        event_data:
+          action: "{{ open_id }}"
+      - platform: event
+        event_type: mobile_app_notification_action
+        event_data:
+          action: "{{ ignore_id }}"
+    timeout:
+      seconds: "{{ timeout_s }}"
+    continue_on_timeout: true
+  - choose:
+      - conditions:
+          - condition: template
+            value_template: "{{ wait.trigger.event.data.action == open_id }}"
+        sequence:
+          - !input open_door_action
+          - repeat:
+              for_each: "{{ recipients }}"
+              sequence:
+                - service: "{{ repeat.item }}"
+                  data:
+                    message: "✅ {{ door_name }} wurde geöffnet."
+                    data:
+                      tag: "{{ tag }}"
+                      group: doorbell
+                      timeout: 30
+    default:
+      - repeat:
+          for_each: "{{ recipients }}"
+          sequence:
+            - service: "{{ repeat.item }}"
+              data:
+                message: clear_notification
+                data:
+                  tag: "{{ tag }}"
